@@ -18,25 +18,22 @@
 #define ATTR_DIALOG     0x70    /* Black on Light Gray */
 #define ATTR_BTN_SEL    0x0F    /* White on Black */
 
-#define MAX_LINES_LIMIT 1024
-#define MAX_LINE_LEN    254
+#include "TEXT.H"
+/* Embedded compilation preserves BUILD EDITOR's single-source procedure. */
+#define NP_TEXT_EMBEDDED
+#include "TEXT.C"
+#include "HISTORY.H"
+#define NP_HISTORY_EMBEDDED
+#include "HISTORY.C"
 
 typedef struct {
-    SEL    sel;
-    USHORT len;
-} LineDesc;
-
-typedef struct {
-    USHORT   rows;
-    USHORT   cols;
-    USHORT   cur_row;       /* Physical screen row (1..rows-2) */
-    USHORT   cur_col;       /* Physical screen col (0..cols-2) */
-    USHORT   top_line;      /* Document line index at top */
-    USHORT   left_col;      /* Horizontal scroll column */
-    USHORT   total_lines;
-    BOOL     bModified;
-    char     szFilename[64];
-    SEL      selTable;      /* Memory selector for line descriptors */
+    USHORT rows, cols, cur_row, cur_col;
+    ULONG top_line, left_col, total_lines;
+    ULONG cursor_line, cursor_col;
+    Text text;
+    History history;
+    BOOL bModified;
+    char szFilename[64];
 } EditorState;
 
 /* CUA Menu Command IDs */
@@ -48,6 +45,8 @@ typedef struct {
 #define CMD_FILE_EXIT   5
 #define CMD_EDIT_CLEAR  6
 #define CMD_SEARCH_FIND 7
+#define CMD_EDIT_UNDO 8
+#define CMD_EDIT_REDO 9
 
 typedef struct {
     char   *pszText;
@@ -72,6 +71,8 @@ static MenuItem fileItems[] = {
 };
 
 static MenuItem editItems[] = {
+    {" Undo  Ctrl+Z", 'U', CMD_EDIT_UNDO},
+    {" Redo  Ctrl+Y", 'R', CMD_EDIT_REDO},
     {" Clear  Del ", 'C', CMD_EDIT_CLEAR}
 };
 
@@ -85,39 +86,37 @@ static MenuItem optItems[] = {
 
 static MenuBarItem g_Menus[] = {
     {" File ",    'F', 1,  5, fileItems},
-    {" Edit ",    'E', 8,  1, editItems},
+    {" Edit ",    'E', 8,  3, editItems},
     {" Search ",  'S', 15, 1, searchItems},
     {" Options ", 'O', 24, 1, optItems}
 };
 #define NUM_MENUS 4
 
 /* Forward declarations */
-static void SaveFile(EditorState *ed);
+static BOOL SaveFile(EditorState *ed);
+static void CleanupMemory(EditorState *ed);
+static void FileError(EditorState *ed, const char *message);
 static void DrawDocument(EditorState *ed);
 static void DrawScrollbar(const EditorState *ed);
 static void DrawStatusBar(const EditorState *ed);
-static void AllocLineWithText(LineDesc far *pLine, const char far *pSrc, USHORT len);
-static void FreeLine(LineDesc far *pLine);
-
-static LineDesc far *GetLine(EditorState *ed, USHORT idx)
+/* floor(value * steps / range), without a 32-bit product overflow. */
+static USHORT ScaleScroll(ULONG value, ULONG range, USHORT steps)
 {
-    LineDesc far *pTable = (LineDesc far *)MAKEP(ed->selTable, 0);
-    return &pTable[idx];
-}
-
-static char far *GetLineText(LineDesc far *pLine)
-{
-    if (pLine->sel == 0) return NULL;
-    return (char far *)MAKEP(pLine->sel, 0);
+    ULONG remainder=0; USHORT result=0, i;
+    for(i=0;i<steps;i++) {
+        remainder+=value;
+        if(remainder>=range){remainder-=range;result++;}
+    }
+    return result;
 }
 
 static void DrawScrollbar(const EditorState *ed)
 {
-    USHORT track_len = (USHORT)(ed->rows - 3);
+    USHORT track_len = (USHORT)(ed->rows - 4);
     USHORT visible_lines = (USHORT)(ed->rows - 2);
     USHORT thumb_size;
     USHORT thumb_pos = 0;
-    USHORT max_top;
+    ULONG max_top;
     USHORT i;
     USHORT scroll_col = (USHORT)(ed->cols - 1);
 
@@ -128,9 +127,9 @@ static void DrawScrollbar(const EditorState *ed)
         if (thumb_size < 1) thumb_size = 1;
     }
 
-    max_top = (ed->total_lines > visible_lines) ? (USHORT)(ed->total_lines - visible_lines) : 0;
+    max_top = (ed->total_lines > visible_lines) ? (ed->total_lines - visible_lines) : 0;
     if (max_top > 0) {
-        thumb_pos = (USHORT)(((ULONG)ed->top_line * (track_len - thumb_size)) / max_top);
+        thumb_pos = ScaleScroll(ed->top_line>max_top?max_top:ed->top_line,max_top,(USHORT)(track_len-thumb_size));
     }
 
     VioWrtCharStrAtt((PCH)"\x1E", 1, 1, scroll_col, (PBYTE)"\x70", 0);
@@ -168,309 +167,254 @@ static void DrawMenuBar(const EditorState *ed, SHORT nActiveMenu)
 static void DrawStatusBar(const EditorState *ed)
 {
     USHORT status_row = (USHORT)(ed->rows - 1);
-    char szLeft[80];
+    char szLeft[96];
     char szRight[64];
-    USHORT curDocLine = (USHORT)(ed->top_line + (ed->cur_row - 1) + 1);
-    USHORT curDocCol  = (USHORT)(ed->left_col + ed->cur_col + 1);
+    ULONG curDocLine = ed->cursor_line + 1;
+    ULONG curDocCol = ed->cursor_col + 1;
 
     VioWrtNCell((PBYTE)"\x20\x70", ed->cols, status_row, 0, 0);
 
-    sprintf(szLeft, " [%s%s]  [DOS/CRLF] ", ed->szFilename, ed->bModified ? "*" : "");
-    VioWrtCharStrAtt((PCH)szLeft, (USHORT)strlen(szLeft), status_row, 1, (PBYTE)"\x70", 0);
+    sprintf(szLeft, " [%s%s]  [%s] ", ed->szFilename, ed->bModified ? "*" : "", ed->text.eol==2?"DOS/CRLF":ed->text.eol==1?"LF":"CR");
+    VioWrtCharStrAtt((PCH)szLeft, (USHORT)((strlen(szLeft) < (USHORT)(ed->cols - 1)) ? strlen(szLeft) : (USHORT)(ed->cols - 1)), status_row, 1, (PBYTE)"\x70", 0);
 
-    sprintf(szRight, "Ln %u/%u, Col %u \xB3 INS", curDocLine, ed->total_lines, curDocCol);
+    sprintf(szRight, "Ln %lu/%lu, Col %lu \xB3 INS", (unsigned long)curDocLine, (unsigned long)ed->total_lines, (unsigned long)curDocCol);
     if (ed->cols > (USHORT)strlen(szRight) + 2) {
         VioWrtCharStrAtt((PCH)szRight, (USHORT)strlen(szRight), status_row, 
                          (USHORT)(ed->cols - (USHORT)strlen(szRight) - 2), (PBYTE)"\x70", 0);
     }
 }
 
-static void DrawCurrentLine(EditorState *ed)
+/* Write complete cells once per row/chunk instead of blanking then repainting. */
+static void DrawTextRow(EditorState *ed, USHORT row, ULONG index)
 {
-    USHORT canvas_width = (USHORT)(ed->cols - 1);
-    USHORT line_idx = (USHORT)(ed->top_line + (ed->cur_row - 1));
-    char szLineBuf[256];
-
-    VioWrtNCell((PBYTE)"\x20\x17", canvas_width, ed->cur_row, 0, 0);
-
-    if (line_idx < ed->total_lines) {
-        LineDesc far *pLine = GetLine(ed, line_idx);
-        if (pLine->len > ed->left_col) {
-            USHORT avail = (USHORT)(pLine->len - ed->left_col);
-            USHORT count = (avail > canvas_width) ? canvas_width : avail;
-            char far *pText = GetLineText(pLine);
-
-            if (pText != NULL) {
-                _fmemcpy(szLineBuf, pText + ed->left_col, count);
-                VioWrtCharStrAtt((PCH)szLineBuf, count, ed->cur_row, 0, (PBYTE)"\x17", 0);
-            }
+    BYTE cells[256]; char chars[128];
+    USHORT left,n,j,got,e; ULONG start,len;
+    BOOL valid = TextLine(&ed->text,index,&start,&len,&e)==TE_OK;
+    for(left=0;left<ed->cols-1;left+=n) {
+        n=(USHORT)(ed->cols-1-left);if(n>128)n=128;got=0;
+        if(valid && ed->left_col+left<len){
+            ULONG available=len-ed->left_col-left;
+            got=TextRead(&ed->text,start+ed->left_col+left,chars,
+                         available<n?(USHORT)available:n);
         }
+        for(j=0;j<n;j++){cells[j*2]=j<got?(BYTE)chars[j]:' ';cells[j*2+1]=ATTR_CANVAS;}
+        VioWrtCellStr((PCH)cells,(USHORT)(n*2),row,left,0);
     }
 }
-
+static void DrawCurrentLine(EditorState *ed)
+{ DrawTextRow(ed,ed->cur_row,ed->cursor_line); }
 static void DrawDocument(EditorState *ed)
 {
-    USHORT visible_rows = (USHORT)(ed->rows - 2);
-    USHORT canvas_width = (USHORT)(ed->cols - 1);
     USHORT r;
-    char szLineBuf[256];
+    for(r=1;r<ed->rows-1;r++)DrawTextRow(ed,r,ed->top_line+r-1);
+}
 
-    for (r = 0; r < visible_rows; r++) {
-        USHORT line_idx = (USHORT)(ed->top_line + r);
-        USHORT screen_row = (USHORT)(1 + r);
+static void FileError(EditorState *ed, const char *message)
+{
+    BYTE cells[160];
+    USHORT width = ed->cols > 80 ? 80 : ed->cols;
+    USHORT cb = (USHORT)(width * 2);
+    USHORT len = (USHORT)strlen(message);
+    KBDKEYINFO key;
+    if (len > width) len = width;
+    VioReadCellStr((PCH)cells, &cb, (USHORT)(ed->rows - 1), 0, 0);
+    VioWrtNCell((PBYTE)"\x20\x70", width, (USHORT)(ed->rows - 1), 0, 0);
+    VioWrtCharStrAtt((PCH)message, len, (USHORT)(ed->rows - 1), 0, (PBYTE)"\x70", 0);
+    KbdCharIn(&key, IO_WAIT, 0);
+    VioWrtCellStr((PCH)cells, cb, (USHORT)(ed->rows - 1), 0, 0);
+}
 
-        VioWrtNCell((PBYTE)"\x20\x17", canvas_width, screen_row, 0, 0);
+static BOOL InitDocument(EditorState *ed,const char *path)
+{
+    if(strlen(path)>=sizeof(ed->szFilename))return FALSE;
+    TextInit(&ed->text);HistoryInit(&ed->history);strcpy(ed->szFilename,path);
+    ed->total_lines=1;ed->cursor_line=ed->cursor_col=0;
+    ed->top_line=ed->left_col=0;ed->cur_row=1;ed->cur_col=0;ed->bModified=FALSE;
+    return TRUE;
+}
+static BOOL LoadFile(EditorState *ed,const char *path)
+{
+    Text next;HFILE hf;USHORT action,rc;int result;
+    if(strlen(path)>=sizeof(ed->szFilename)){FileError(ed,"Filename too long. Press a key.");return FALSE;}
+    rc=DosOpen((PSZ)path,&hf,&action,0L,FILE_NORMAL,
+        OPEN_ACTION_FAIL_IF_NEW|OPEN_ACTION_OPEN_IF_EXISTS,
+        OPEN_ACCESS_READONLY|OPEN_SHARE_DENYWRITE,0L);
+    if(rc){FileError(ed,"Cannot open file. Press a key.");return FALSE;}
+    TextInit(&next);result=TextLoad(&next,hf);rc=DosClose(hf);
+    if(result || rc){
+        TextFree(&next);
+        FileError(ed,result==TE_MEMORY?"Out of memory. Document retained. Press a key.":
+                     result==TE_RANGE?"Document exceeds byte address limit. Press a key.":
+                     "Read/close error. Document retained. Press a key.");
+        return FALSE;
+    }
+    TextFree(&ed->text);HistoryFree(&ed->history);ed->text=next;strcpy(ed->szFilename,path);
+    ed->total_lines=next.lines;ed->cursor_line=ed->cursor_col=0;
+    ed->top_line=ed->left_col=0;ed->cur_row=1;ed->cur_col=0;ed->bModified=FALSE;
+    return TRUE;
+}
 
-        if (line_idx < ed->total_lines) {
-            LineDesc far *pLine = GetLine(ed, line_idx);
-            if (pLine->len > ed->left_col) {
-                USHORT avail = (USHORT)(pLine->len - ed->left_col);
-                USHORT count = (avail > canvas_width) ? canvas_width : avail;
-                char far *pText = GetLineText(pLine);
+/* Reserve a sibling name without overwriting any pre-existing file. */
+static BOOL ReserveFile(const char *path, char *name, HFILE *hf)
+{
+    char *base;
+    const char *targetBase;
+    USHORT n, action, rc;
+    strcpy(name, path);
+    base = name;
+    for (n = 0; name[n]; n++)
+        if (name[n] == '\\' || name[n] == '/' || name[n] == ':') base = name + n + 1;
+    targetBase = path + (base - name);
+    for (n = 0; n < 1000; n++) {
+        sprintf(base, "NP%03u.TMP", n);
+        if (!stricmp(base, targetBase)) continue;
+        rc = DosOpen(name, hf, &action, 0L, FILE_NORMAL,
+            OPEN_ACTION_CREATE_IF_NEW | OPEN_ACTION_FAIL_IF_EXISTS,
+            OPEN_ACCESS_WRITEONLY | OPEN_SHARE_DENYREADWRITE, 0L);
+        if (!rc) return TRUE;
+        if (rc != ERROR_FILE_EXISTS && rc != ERROR_OPEN_FAILED) return FALSE;
+    }
+    return FALSE;
+}
 
-                if (pText != NULL) {
-                    _fmemcpy(szLineBuf, pText + ed->left_col, count);
-                    VioWrtCharStrAtt((PCH)szLineBuf, count, screen_row, 0, (PBYTE)"\x17", 0);
-                }
-            }
+static BOOL SaveFile(EditorState *ed)
+{
+    HFILE hf, bh;
+    USHORT rc;
+    char temp[80], backup[80];
+    BOOL ok = TRUE, hadOld = FALSE;
+    HistoryBreak(&ed->history);
+    if (!ReserveFile(ed->szFilename, temp, &hf)) {
+        FileError(ed, "Cannot create save file. Press a key.");
+        return FALSE;
+    }
+    ok = TextWrite(&ed->text,hf)==TE_OK;
+    if (DosClose(hf)) ok = FALSE;
+    if (!ok) {
+        DosDelete(temp, 0L);
+        FileError(ed, "Write/close failed. Original retained. Press a key.");
+        return FALSE;
+    }
+    /* Move old target aside; failure to install new data must be recoverable. */
+    if (!ReserveFile(ed->szFilename, backup, &bh)) {
+        DosDelete(temp, 0L);
+        FileError(ed, "Cannot reserve backup. Original retained. Press a key.");
+        return FALSE;
+    }
+    rc = DosClose(bh);
+    if (!rc) rc = DosDelete(backup, 0L);
+    if (!rc) rc = DosMove(ed->szFilename, backup, 0L);
+    if (!rc) hadOld = TRUE;
+    else if (rc != ERROR_FILE_NOT_FOUND) {
+        DosDelete(temp, 0L);
+        FileError(ed, "Cannot back up target. Save failed. Press a key.");
+        return FALSE;
+    }
+    rc = DosMove(temp, ed->szFilename, 0L);
+    if (rc) {
+        if (hadOld && DosMove(backup, ed->szFilename, 0L)) {
+            FileError(ed, backup);
+            FileError(ed, temp);
+            FileError(ed, "Recovery files above retained. Save failed. Press a key.");
+        } else {
+            DosDelete(temp, 0L);
+            FileError(ed, "Cannot install save. Original restored. Press a key.");
         }
+        return FALSE;
     }
-}
-
-static void AllocLineWithText(LineDesc far *pLine, const char far *pSrc, USHORT len)
-{
-    char far *pDest;
-    pLine->len = len;
-    DosAllocSeg(MAX_LINE_LEN + 1, &pLine->sel, 0);
-    pDest = (char far *)MAKEP(pLine->sel, 0);
-    if (len > 0 && pSrc != NULL) {
-        _fmemcpy(pDest, pSrc, len);
+    if (hadOld && DosDelete(backup, 0L)) {
+        FileError(ed, backup);
+        FileError(ed, "Saved; old backup could not be removed. Press a key.");
     }
-    pDest[len] = '\0';
-}
-
-static void FreeLine(LineDesc far *pLine)
-{
-    if (pLine->sel != 0) {
-        DosFreeSeg(pLine->sel);
-        pLine->sel = 0;
-        pLine->len = 0;
-    }
-}
-
-static void LoadFile(EditorState *ed, const char *pszPath)
-{
-    HFILE hf;
-    USHORT usAction;
-    USHORT usRc;
-    ULONG  cbFile;
-    USHORT cbRead;
-    SEL    selRaw;
-    char far *pRawText;
-    ULONG i;
-    ULONG lineStart = 0;
-
-    strcpy(ed->szFilename, pszPath);
-    DosAllocSeg((USHORT)(sizeof(LineDesc) * MAX_LINES_LIMIT), &ed->selTable, 0);
-
-    usRc = DosOpen((PSZ)pszPath, &hf, &usAction, 0L, FILE_NORMAL,
-                   OPEN_ACTION_FAIL_IF_NEW | OPEN_ACTION_OPEN_IF_EXISTS,
-                   OPEN_ACCESS_READONLY | OPEN_SHARE_DENYNONE, 0L);
-
-    if (usRc != 0) {
-        LineDesc far *pLine = GetLine(ed, 0);
-        AllocLineWithText(pLine, NULL, 0);
-        ed->total_lines = 1;
-        return;
-    }
-
-    DosChgFilePtr(hf, 0L, FILE_END, &cbFile);
-    DosChgFilePtr(hf, 0L, FILE_BEGIN, &lineStart);
-
-    DosAllocSeg((USHORT)cbFile + 1, &selRaw, 0);
-    pRawText = (char far *)MAKEP(selRaw, 0);
-
-    DosRead(hf, pRawText, (USHORT)cbFile, &cbRead);
-    DosClose(hf);
-    pRawText[cbRead] = '\0';
-
-    ed->total_lines = 0;
-    lineStart = 0;
-
-    for (i = 0; i <= cbRead && ed->total_lines < MAX_LINES_LIMIT; i++) {
-        if (i == cbRead || pRawText[i] == '\n') {
-            ULONG len = i - lineStart;
-            LineDesc far *pLine = GetLine(ed, ed->total_lines);
-
-            if (len > 0 && pRawText[lineStart + len - 1] == '\r') {
-                len--;
-            }
-            if (len > MAX_LINE_LEN) {
-                len = MAX_LINE_LEN;
-            }
-
-            AllocLineWithText(pLine, pRawText + lineStart, (USHORT)len);
-            ed->total_lines++;
-            lineStart = i + 1;
-        }
-    }
-
-    DosFreeSeg(selRaw);
-
-    if (ed->total_lines == 0) {
-        LineDesc far *pLine = GetLine(ed, 0);
-        AllocLineWithText(pLine, NULL, 0);
-        ed->total_lines = 1;
-    }
-}
-
-static void SaveFile(EditorState *ed)
-{
-    HFILE hf;
-    USHORT usAction;
-    USHORT usRc;
-    USHORT i;
-    USHORT cbWritten;
-
-    usRc = DosOpen((PSZ)ed->szFilename, &hf, &usAction, 0L, FILE_NORMAL,
-                   OPEN_ACTION_CREATE_IF_NEW | OPEN_ACTION_REPLACE_IF_EXISTS,
-                   OPEN_ACCESS_WRITEONLY | OPEN_SHARE_DENYREADWRITE, 0L);
-
-    if (usRc != 0) return;
-
-    for (i = 0; i < ed->total_lines; i++) {
-        LineDesc far *pLine = GetLine(ed, i);
-        char far *pText = GetLineText(pLine);
-
-        if (pLine->len > 0 && pText != NULL) {
-            DosWrite(hf, pText, pLine->len, &cbWritten);
-        }
-        DosWrite(hf, "\r\n", 2, &cbWritten);
-    }
-
-    DosClose(hf);
+    HistorySaved(&ed->history);
     ed->bModified = FALSE;
+    return TRUE;
 }
 
-static void InsertChar(EditorState *ed, char ch)
+static void SetPosition(EditorState *ed,ULONG line,ULONG col)
 {
-    USHORT line_idx = (USHORT)(ed->top_line + (ed->cur_row - 1));
-    USHORT col_idx = (USHORT)(ed->left_col + ed->cur_col);
-    LineDesc far *pLine = GetLine(ed, line_idx);
-    char far *pText = GetLineText(pLine);
-    USHORT i;
-
-    if (pLine->len >= MAX_LINE_LEN) return;
-
-    for (i = pLine->len; i > col_idx; i--) {
-        pText[i] = pText[i - 1];
-    }
-    pText[col_idx] = ch;
-    pLine->len++;
-    pText[pLine->len] = '\0';
-
-    ed->bModified = TRUE;
-
-    if (ed->cur_col < ed->cols - 2) {
-        ed->cur_col++;
-    } else {
-        ed->left_col++;
-    }
+    ULONG start,len;USHORT ending;
+    if(line>=ed->total_lines)line=ed->total_lines-1;
+    TextLine(&ed->text,line,&start,&len,&ending);if(col>len)col=len;
+    ed->cursor_line=line;ed->cursor_col=col;
+    if(line<ed->top_line)ed->top_line=line;
+    if(line>=ed->top_line+ed->rows-2)ed->top_line=line-(ed->rows-3);
+    if(col<ed->left_col)ed->left_col=col;
+    if(col>=ed->left_col+ed->cols-1)ed->left_col=col-(ed->cols-2);
+    ed->cur_row=(USHORT)(line-ed->top_line+1);ed->cur_col=(USHORT)(col-ed->left_col);
 }
-
+static void Navigate(EditorState *ed,USHORT scan)
+{
+    ULONG line=ed->cursor_line,col=ed->cursor_col,start,len;USHORT e;
+    HistoryBreak(&ed->history);
+    TextLine(&ed->text,line,&start,&len,&e);
+    switch(scan){
+    case 0x47:col=0;break;
+    case 0x4f:col=len;break;
+    case 0x77:line=col=0;break;
+    case 0x75:line=ed->total_lines-1;col=TEXT_MAX;break;
+    case 0x48:if(line)line--;break;
+    case 0x50:if(line+1<ed->total_lines)line++;break;
+    case 0x4b:if(col)col--;else if(line){line--;col=TEXT_MAX;}break;
+    case 0x4d:if(col<len)col++;else if(line+1<ed->total_lines){line++;col=0;}break;
+    case 0x49:line=line>(ULONG)(ed->rows-2)?line-(ed->rows-2):0;break;
+    case 0x51:line+=ed->rows-2;break;
+    }
+    SetPosition(ed,line,col);
+}
+static BOOL EditResult(EditorState *ed,int rc)
+{
+    if(rc){FileError(ed,rc==TE_MEMORY?"Out of memory. Operation cancelled. Press a key.":rc==HE_LIMIT?"History disabled by its limits. Edit cancelled. Press a key.":"Invalid or oversized edit. Press a key.");return FALSE;}
+    TextRecount(&ed->text);ed->total_lines=ed->text.lines;ed->bModified=HistoryModified(&ed->history);return TRUE;
+}
+static int RecordEdit(EditorState *ed,ULONG at,const char far *data,
+                      USHORT n,BOOL insert,BOOL typing,ULONG line,ULONG col)
+{
+    HistoryPos before,after;
+    before.line=ed->cursor_line;before.col=ed->cursor_col;
+    after.line=line;after.col=col;
+    return HistoryEdit(&ed->history,&ed->text,at,data,n,insert,typing,before,after);
+}
+static BOOL UndoRedo(EditorState *ed,BOOL redo)
+{
+    HistoryPos pos;int rc=HistoryStep(&ed->history,&ed->text,redo,&pos);
+    if(rc==HE_EMPTY)return FALSE;
+    if(!EditResult(ed,rc))return FALSE;
+    SetPosition(ed,pos.line,pos.col);
+    return TRUE;
+}
+static void InsertChar(EditorState *ed,char ch)
+{
+    ULONG start,len;USHORT e;
+    TextLine(&ed->text,ed->cursor_line,&start,&len,&e);
+    if(EditResult(ed,RecordEdit(ed,start+ed->cursor_col,&ch,1,TRUE,
+        (ch!=' ' && ch!='\t'),ed->cursor_line,ed->cursor_col+1)))
+        SetPosition(ed,ed->cursor_line,ed->cursor_col+1);
+}
 static void InsertNewline(EditorState *ed)
 {
-    USHORT line_idx = (USHORT)(ed->top_line + (ed->cur_row - 1));
-    USHORT col_idx = (USHORT)(ed->left_col + ed->cur_col);
-    USHORT i;
-    LineDesc far *pCur;
-    LineDesc far *pNext;
-    char far *pCurText;
-
-    if (ed->total_lines >= MAX_LINES_LIMIT) return;
-
-    for (i = ed->total_lines; i > line_idx + 1; i--) {
-        LineDesc far *pSrc = GetLine(ed, (USHORT)(i - 1));
-        LineDesc far *pDst = GetLine(ed, i);
-        *pDst = *pSrc;
-    }
-
-    pCur = GetLine(ed, line_idx);
-    pNext = GetLine(ed, (USHORT)(line_idx + 1));
-    pCurText = GetLineText(pCur);
-
-    AllocLineWithText(pNext, pCurText + col_idx, (USHORT)(pCur->len - col_idx));
-
-    pCur->len = col_idx;
-    pCurText[col_idx] = '\0';
-
-    ed->total_lines++;
-    ed->bModified = TRUE;
-
-    ed->cur_col = 0;
-    ed->left_col = 0;
-    if (ed->cur_row < ed->rows - 2) {
-        ed->cur_row++;
-    } else {
-        ed->top_line++;
-    }
+    ULONG start,len;USHORT e;
+    TextLine(&ed->text,ed->cursor_line,&start,&len,&e);
+    if(EditResult(ed,RecordEdit(ed,start+ed->cursor_col,
+        ed->text.eol==2?"\r\n":ed->text.eol==3?"\r":"\n",ed->text.eol==2?2:1,TRUE,FALSE,ed->cursor_line+1,0)))
+        SetPosition(ed,ed->cursor_line+1,0);
 }
-
 static void DeleteCharBack(EditorState *ed)
 {
-    USHORT line_idx = (USHORT)(ed->top_line + (ed->cur_row - 1));
-    USHORT col_idx = (USHORT)(ed->left_col + ed->cur_col);
-    LineDesc far *pLine;
-    char far *pText;
-    USHORT i;
-
-    if (col_idx > 0) {
-        pLine = GetLine(ed, line_idx);
-        pText = GetLineText(pLine);
-
-        for (i = (USHORT)(col_idx - 1); i < pLine->len; i++) {
-            pText[i] = pText[i + 1];
-        }
-        pLine->len--;
-        ed->bModified = TRUE;
-
-        if (ed->cur_col > 0) {
-            ed->cur_col--;
-        } else if (ed->left_col > 0) {
-            ed->left_col--;
-        }
-    } else if (line_idx > 0) {
-        LineDesc far *pPrev = GetLine(ed, (USHORT)(line_idx - 1));
-        char far *pPrevText = GetLineText(pPrev);
-        pLine = GetLine(ed, line_idx);
-        pText = GetLineText(pLine);
-
-        if ((USHORT)(pPrev->len + pLine->len) <= MAX_LINE_LEN) {
-            USHORT old_prev_len = pPrev->len;
-            _fmemcpy(pPrevText + old_prev_len, pText, pLine->len);
-            pPrev->len += pLine->len;
-            pPrevText[pPrev->len] = '\0';
-
-            FreeLine(pLine);
-
-            for (i = line_idx; i < ed->total_lines - 1; i++) {
-                LineDesc far *pSrc = GetLine(ed, (USHORT)(i + 1));
-                LineDesc far *pDst = GetLine(ed, i);
-                *pDst = *pSrc;
-            }
-
-            ed->total_lines--;
-            ed->bModified = TRUE;
-
-            if (ed->cur_row > 1) {
-                ed->cur_row--;
-            } else if (ed->top_line > 0) {
-                ed->top_line--;
-            }
-            ed->cur_col = (old_prev_len < ed->cols - 2) ? old_prev_len : (USHORT)(ed->cols - 2);
-            ed->left_col = (old_prev_len >= ed->cols - 2) ? (USHORT)(old_prev_len - (ed->cols - 2)) : 0;
-        }
+    ULONG start,len,p,l,line=ed->cursor_line,col=ed->cursor_col;USHORT e,pe;
+    TextLine(&ed->text,line,&start,&len,&e);
+    if(col){if(EditResult(ed,RecordEdit(ed,start+col-1,NULL,1,FALSE,FALSE,line,col-1)))SetPosition(ed,line,col-1);}
+    else if(line){
+        TextLine(&ed->text,line-1,&p,&l,&pe);
+        if(EditResult(ed,RecordEdit(ed,start-pe,NULL,pe,FALSE,FALSE,line-1,l)))SetPosition(ed,line-1,l);
     }
+}
+static void DeleteCharForward(EditorState *ed)
+{
+    ULONG start,len;USHORT e;
+    TextLine(&ed->text,ed->cursor_line,&start,&len,&e);
+    if(ed->cursor_col<len)EditResult(ed,RecordEdit(ed,start+ed->cursor_col,NULL,1,FALSE,FALSE,ed->cursor_line,ed->cursor_col));
+    else if(e)EditResult(ed,RecordEdit(ed,start+len,NULL,e,FALSE,FALSE,ed->cursor_line,ed->cursor_col));
 }
 
 /* Save screen cells underneath popup dialogs/menus */
@@ -512,7 +456,8 @@ static void DrawDropdownMenu(USHORT top, USHORT left, MenuBarItem *pMenu, SHORT 
     for (i = 0; i < pMenu->itemCount; i++) {
         BYTE bAttr = (nSel == (SHORT)i) ? ATTR_MENU_SEL : ATTR_MENU;
         VioWrtCharStrAtt((PCH)"\xB3", 1, (USHORT)(top + 1 + i), left, (PBYTE)"\x70", 0);
-        VioWrtCharStrAtt((PCH)pMenu->items[i].pszText, (USHORT)(w - 2), (USHORT)(top + 1 + i), (USHORT)(left + 1), &bAttr, 0);
+        VioWrtNCell((PBYTE)"\x20\x70", (USHORT)(w - 2), (USHORT)(top + 1 + i), (USHORT)(left + 1), 0);
+        VioWrtCharStrAtt((PCH)pMenu->items[i].pszText, (USHORT)strlen(pMenu->items[i].pszText), (USHORT)(top + 1 + i), (USHORT)(left + 1), &bAttr, 0);
         VioWrtCharStrAtt((PCH)"\xB3", 1, (USHORT)(top + 1 + i), (USHORT)(left + w - 1), (PBYTE)"\x70", 0);
     }
 
@@ -535,6 +480,7 @@ static USHORT RunMenu(EditorState *ed, SHORT nMenuIdx)
     USHORT usTop = 1;
     USHORT usLeft;
 
+    HistoryBreak(&ed->history);
     while (1) {
         usH = (USHORT)(g_Menus[nCurMenu].itemCount + 2);
         usLeft = g_Menus[nCurMenu].usCol;
@@ -665,6 +611,7 @@ static BOOL PromptFilename(EditorState *ed, const char *pszTitle, char *pszBuffe
     USHORT fieldLen = 38;
     USHORT curLen = (USHORT)strlen(pszBuffer);
     USHORT curPos = curLen;
+    USHORT fieldLeft = 0;
     KBDKEYINFO kki;
     char szBorder[50];
     char szField[40];
@@ -699,9 +646,12 @@ static BOOL PromptFilename(EditorState *ed, const char *pszTitle, char *pszBuffe
         VioWrtCharStrAtt((PCH)"Filename:", 9, (USHORT)(dTop + 2), (USHORT)(dLeft + 4), (PBYTE)"\x70", 0);
 
         /* Input field background */
+        if (curPos < fieldLeft) fieldLeft = curPos;
+        if (curPos >= fieldLeft + fieldLen) fieldLeft = (USHORT)(curPos - fieldLen + 1);
         memset(szField, ' ', fieldLen);
         if (curLen > 0) {
-            memcpy(szField, pszBuffer, (curLen > fieldLen) ? fieldLen : curLen);
+            memcpy(szField, pszBuffer + fieldLeft,
+                   (curLen - fieldLeft > fieldLen) ? fieldLen : curLen - fieldLeft);
         }
         VioWrtCharStrAtt((PCH)"[", 1, (USHORT)(dTop + 3), (USHORT)(dLeft + 3), (PBYTE)"\x70", 0);
         VioWrtCharStrAtt((PCH)szField, fieldLen, (USHORT)(dTop + 3), (USHORT)(dLeft + 4), (PBYTE)"\x0F", 0);
@@ -711,7 +661,7 @@ static BOOL PromptFilename(EditorState *ed, const char *pszTitle, char *pszBuffe
         VioWrtCharStrAtt((PCH)"< OK >", 6, (USHORT)(dTop + 5), (USHORT)(dLeft + 12), (PBYTE)"\x0F", 0);
         VioWrtCharStrAtt((PCH)"< Cancel >", 10, (USHORT)(dTop + 5), (USHORT)(dLeft + 24), (PBYTE)"\x70", 0);
 
-        VioSetCurPos((USHORT)(dTop + 3), (USHORT)(dLeft + 4 + curPos), 0);
+        VioSetCurPos((USHORT)(dTop + 3), (USHORT)(dLeft + 4 + curPos - fieldLeft), 0);
 
         KbdCharIn(&kki, IO_WAIT, 0);
 
@@ -737,11 +687,11 @@ static BOOL PromptFilename(EditorState *ed, const char *pszTitle, char *pszBuffe
                     if (curPos > 0) curPos--;
                     break;
                 case 0x4D: /* Right */
-                    if (curPos < curLen && curPos < fieldLen) curPos++;
+                    if (curPos < curLen) curPos++;
                     break;
             }
         } else if ((UCHAR)kki.chChar >= 32 && (UCHAR)kki.chChar != 127) {
-            if (curLen < maxLen - 1 && curLen < fieldLen) {
+            if (curLen < maxLen - 1) {
                 USHORT i;
                 for (i = curLen; i > curPos; i--) {
                     pszBuffer[i] = pszBuffer[i - 1];
@@ -761,12 +711,14 @@ static BOOL PromptFilename(EditorState *ed, const char *pszTitle, char *pszBuffe
 static void DoFileSaveAs(EditorState *ed)
 {
     char szNewPath[64];
+    char oldPath[64];
     strcpy(szNewPath, ed->szFilename);
 
     if (PromptFilename(ed, "Save As", szNewPath, sizeof(szNewPath))) {
         if (strlen(szNewPath) > 0) {
+            strcpy(oldPath, ed->szFilename);
             strcpy(ed->szFilename, szNewPath);
-            SaveFile(ed);
+            if (!SaveFile(ed)) strcpy(ed->szFilename, oldPath);
             DrawStatusBar(ed);
         }
     }
@@ -780,7 +732,7 @@ static void DoFileOpen(EditorState *ed)
     if (ed->bModified) {
         SHORT nRes = ShowSavePrompt(ed);
         if (nRes == 1) {
-            SaveFile(ed);
+            if (!SaveFile(ed)) return;
         } else if (nRes == -1) {
             return;
         }
@@ -788,22 +740,7 @@ static void DoFileOpen(EditorState *ed)
 
     if (PromptFilename(ed, "Open File", szOpenPath, sizeof(szOpenPath))) {
         if (strlen(szOpenPath) > 0) {
-            USHORT i;
-            for (i = 0; i < ed->total_lines; i++) {
-                LineDesc far *pLine = GetLine(ed, i);
-                FreeLine(pLine);
-            }
-            if (ed->selTable) {
-                DosFreeSeg(ed->selTable);
-                ed->selTable = 0;
-            }
-
-            LoadFile(ed, szOpenPath);
-            ed->top_line = 0;
-            ed->left_col = 0;
-            ed->cur_row = 1;
-            ed->cur_col = 0;
-            ed->bModified = FALSE;
+            if (!LoadFile(ed, szOpenPath)) return;
 
             DrawDocument(ed);
             DrawScrollbar(ed);
@@ -814,33 +751,18 @@ static void DoFileOpen(EditorState *ed)
 
 static void DoFileNew(EditorState *ed)
 {
-    USHORT i;
-    LineDesc far *pLine;
-
     if (ed->bModified) {
         SHORT nRes = ShowSavePrompt(ed);
         if (nRes == 1) {
-            SaveFile(ed);
+            if (!SaveFile(ed)) return;
         } else if (nRes == -1) {
             return;
         }
     }
 
-    for (i = 0; i < ed->total_lines; i++) {
-        pLine = GetLine(ed, i);
-        FreeLine(pLine);
-    }
-
-    strcpy(ed->szFilename, "UNTITLED.TXT");
-    pLine = GetLine(ed, 0);
-    AllocLineWithText(pLine, NULL, 0);
-
-    ed->total_lines = 1;
-    ed->top_line = 0;
-    ed->left_col = 0;
-    ed->cur_row = 1;
-    ed->cur_col = 0;
-    ed->bModified = FALSE;
+    TextFree(&ed->text);
+    HistoryFree(&ed->history);
+    InitDocument(ed,"UNTITLED.TXT");
 
     DrawDocument(ed);
     DrawScrollbar(ed);
@@ -849,14 +771,7 @@ static void DoFileNew(EditorState *ed)
 }
 
 static void CleanupMemory(EditorState *ed)
-{
-    USHORT i;
-    for (i = 0; i < ed->total_lines; i++) {
-        LineDesc far *pLine = GetLine(ed, i);
-        FreeLine(pLine);
-    }
-    if (ed->selTable) DosFreeSeg(ed->selTable);
-}
+{ HistoryFree(&ed->history);TextFree(&ed->text); }
 
 int main(int argc, char *argv[])
 {
@@ -864,13 +779,18 @@ int main(int argc, char *argv[])
     KBDKEYINFO kki;
     EditorState ed;
     BOOL bRunning = TRUE;
-    USHORT old_line_count;
+    ULONG old_line_count, old_top, old_left;
+    USHORT old_row, old_col;
+    BOOL old_modified, changedLine;
     USHORT usCmd;
     SHORT nRes;
     const char *pszTarget = (argc > 1) ? argv[1] : "NEWFILE.TXT";
 
     vmi.cb = sizeof(vmi);
-    VioGetMode(&vmi, 0);
+    if (VioGetMode(&vmi, 0) || vmi.row < 10 || vmi.col < 46) {
+        printf("NP16 requires at least 46 columns and 10 rows.\n");
+        return 1;
+    }
 
     memset(&ed, 0, sizeof(ed));
     ed.rows = vmi.row;
@@ -881,7 +801,16 @@ int main(int argc, char *argv[])
     ed.left_col = 0;
     ed.bModified = FALSE;
 
-    LoadFile(&ed, pszTarget);
+    if (!InitDocument(&ed, "NEWFILE.TXT")) {
+        CleanupMemory(&ed);
+        printf("Cannot allocate initial document.\n");
+        return 1;
+    }
+    ed.total_lines = 1;
+    if (argc > 1 && !LoadFile(&ed, pszTarget)) {
+        CleanupMemory(&ed);
+        return 1;
+    }
 
     DrawMenuBar(&ed, -1);
     DrawDocument(&ed);
@@ -890,59 +819,25 @@ int main(int argc, char *argv[])
     VioSetCurPos(ed.cur_row, ed.cur_col, 0);
 
     while (bRunning) {
-        KbdCharIn(&kki, IO_WAIT, 0);
+        if (KbdCharIn(&kki, IO_WAIT, 0)) break;
+        old_line_count = ed.total_lines;
+        old_top = ed.top_line; old_left = ed.left_col;
+        old_row = ed.cur_row; old_col = ed.cur_col;
+        old_modified = ed.bModified;
+        changedLine = FALSE;
+        usCmd=CMD_NONE;
+        if(kki.chChar<32 || kki.chChar==0xE0)HistoryBreak(&ed.history);
 
         if (kki.chChar == 0 || (UCHAR)kki.chChar == 0xE0) {
             switch (kki.chScan) {
-                case 0x48: /* Up */
-                    if (ed.cur_row > 1) {
-                        ed.cur_row--;
-                    } else if (ed.top_line > 0) {
-                        ed.top_line--;
-                        DrawDocument(&ed);
-                        DrawScrollbar(&ed);
-                    }
+                case 0x77: case 0x75:
+                case 0x47: case 0x4F: case 0x48: case 0x50:
+                case 0x4B: case 0x4D: case 0x49: case 0x51:
+                    Navigate(&ed, kki.chScan);
                     break;
-                case 0x50: /* Down */
-                    if (ed.cur_row < ed.rows - 2 && (ed.top_line + ed.cur_row) < ed.total_lines) {
-                        ed.cur_row++;
-                    } else if ((ed.top_line + (ed.rows - 2)) < ed.total_lines) {
-                        ed.top_line++;
-                        DrawDocument(&ed);
-                        DrawScrollbar(&ed);
-                    }
-                    break;
-                case 0x4B: /* Left */
-                    if (ed.cur_col > 0) {
-                        ed.cur_col--;
-                    } else if (ed.left_col > 0) {
-                        ed.left_col--;
-                        DrawDocument(&ed);
-                    }
-                    break;
-                case 0x4D: /* Right */
-                    if (ed.cur_col < ed.cols - 2) {
-                        ed.cur_col++;
-                    } else {
-                        ed.left_col++;
-                        DrawDocument(&ed);
-                    }
-                    break;
-                case 0x49: /* Page Up */
-                    if (ed.top_line >= (ed.rows - 2)) {
-                        ed.top_line -= (ed.rows - 2);
-                    } else {
-                        ed.top_line = 0;
-                    }
-                    DrawDocument(&ed);
-                    DrawScrollbar(&ed);
-                    break;
-                case 0x51: /* Page Down */
-                    if (ed.top_line + (ed.rows - 2) < ed.total_lines) {
-                        ed.top_line += (ed.rows - 2);
-                        DrawDocument(&ed);
-                        DrawScrollbar(&ed);
-                    }
+                case 0x53:
+                    DeleteCharForward(&ed);
+                    changedLine = TRUE;
                     break;
                 case 0x3F: /* F5: Save File */
                     SaveFile(&ed);
@@ -962,8 +857,7 @@ int main(int argc, char *argv[])
                         if (ed.bModified) {
                             nRes = ShowSavePrompt(&ed);
                             if (nRes == 1) {
-                                SaveFile(&ed);
-                                bRunning = FALSE;
+                                if (SaveFile(&ed)) bRunning = FALSE;
                             } else if (nRes == 0) {
                                 bRunning = FALSE;
                             }
@@ -974,6 +868,10 @@ int main(int argc, char *argv[])
                     break;
                 case 0x12: /* Alt+E: Edit Menu */
                     usCmd = RunMenu(&ed, 1);
+                    if (usCmd == CMD_EDIT_CLEAR) {
+                        DeleteCharForward(&ed);
+                        changedLine = TRUE;
+                    }
                     break;
                 case 0x1F: /* Alt+S: Search Menu */
                     usCmd = RunMenu(&ed, 2);
@@ -982,12 +880,13 @@ int main(int argc, char *argv[])
                     usCmd = RunMenu(&ed, 3);
                     break;
             }
+        } else if (kki.chChar == 26 || kki.chChar == 25) {
+            changedLine=UndoRedo(&ed,kki.chChar==25);
         } else if (kki.chChar == 0x1B) {
             if (ed.bModified) {
                 nRes = ShowSavePrompt(&ed);
                 if (nRes == 1) {
-                    SaveFile(&ed);
-                    bRunning = FALSE;
+                    if (SaveFile(&ed)) bRunning = FALSE;
                 } else if (nRes == 0) {
                     bRunning = FALSE;
                 }
@@ -996,23 +895,29 @@ int main(int argc, char *argv[])
             }
         } else if (kki.chChar == '\r') {
             InsertNewline(&ed);
-            DrawDocument(&ed);
-            DrawScrollbar(&ed);
+            changedLine = TRUE;
         } else if (kki.chChar == '\b') {
-            old_line_count = ed.total_lines;
             DeleteCharBack(&ed);
-            if (ed.total_lines != old_line_count) {
-                DrawDocument(&ed);
-                DrawScrollbar(&ed);
-            } else {
-                DrawCurrentLine(&ed);
-            }
+            changedLine = TRUE;
         } else if ((UCHAR)kki.chChar >= 32 && (UCHAR)kki.chChar != 127) {
             InsertChar(&ed, kki.chChar);
-            DrawCurrentLine(&ed);
+            changedLine = TRUE;
         }
 
-        DrawStatusBar(&ed);
+        if(usCmd==CMD_EDIT_UNDO || usCmd==CMD_EDIT_REDO)
+            changedLine=UndoRedo(&ed,usCmd==CMD_EDIT_REDO);
+
+        if (old_top != ed.top_line || old_left != ed.left_col ||
+            old_line_count != ed.total_lines) DrawDocument(&ed);
+        else if (changedLine) {
+            if(old_row!=ed.cur_row)DrawTextRow(&ed,old_row,ed.top_line+old_row-1);
+            DrawCurrentLine(&ed);
+        }
+        if (old_top != ed.top_line || old_line_count != ed.total_lines)
+            DrawScrollbar(&ed);
+        if (changedLine || old_modified != ed.bModified || old_top != ed.top_line ||
+            old_left != ed.left_col || old_row != ed.cur_row || old_col != ed.cur_col)
+            DrawStatusBar(&ed);
         VioSetCurPos(ed.cur_row, ed.cur_col, 0);
     }
 
